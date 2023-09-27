@@ -131,7 +131,7 @@ sqlCipherExport DBEncryptionConfig {currentKey = DBEncryptionKey key, newKey = D
     backup `with` fs
     liftIO $ putStrLn "LALAL 4"
     (export chatDb chatEncrypted >> export agentDb agentEncrypted)
-      `catchChatError` \e -> (restore `with` fs) >> throwError e
+      `catchChatError` \e -> tryChatError (restore `with` fs) >> throwError e
   where
     action `with` StorageFiles {chatDb, agentDb} = action chatDb >> action agentDb
     backup f = copyFile f (f <> ".bak")
