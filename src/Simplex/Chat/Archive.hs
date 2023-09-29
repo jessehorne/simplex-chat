@@ -110,7 +110,6 @@ data StorageFiles = StorageFiles
 
 storageFiles :: ChatMonad m => m StorageFiles
 storageFiles = do
-  liftIO $ putStrLn "LALAL 11"
   ChatController {chatStore, filesFolder, smpAgent} <- ask
   let agentStore = agentClientStore smpAgent
   filesPath <- readTVarIO filesFolder
@@ -136,7 +135,6 @@ sqlCipherExport DBEncryptionConfig {currentKey = DBEncryptionKey key, newKey = D
     checkEncryption SQLiteStore {dbEncrypted} = do
       enc <- readTVarIO dbEncrypted
       when (enc && null key) $ throwDBError DBErrorEncrypted
-      liftIO $ putStrLn "LALAL 43"
       when (not enc && not (null key)) $ throwDBError DBErrorPlaintext
     exported = (<> ".exported")
     removeExported f = whenM (doesFileExist $ exported f) $ removeFile (exported f)
