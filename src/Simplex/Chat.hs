@@ -57,6 +57,8 @@ import Simplex.Chat.Messages.CIContent
 import Simplex.Chat.Options
 import Simplex.Chat.ProfileGenerator (generateRandomProfile)
 import Simplex.Chat.Protocol
+import Simplex.Chat.Remote
+import Simplex.Chat.Remote.Types
 import Simplex.Chat.Store
 import Simplex.Chat.Store.Connections
 import Simplex.Chat.Store.Direct
@@ -185,6 +187,7 @@ newChatController ChatDatabase {chatStore, agentStore} user cfg@ChatConfig {agen
       config = cfg {logLevel, showReactions, tbqSize, subscriptionEvents = logConnections, hostEvents = logServerHosts, defaultServers = configServers, inlineFiles = inlineFiles', autoAcceptFileSize}
       firstTime = dbNew chatStore
   currentUser <- newTVarIO user
+  currentRemoteHost <- newTVarIO Nothing
   servers <- agentServers config
   smpAgent <- getSMPAgentClient aCfg {tbqSize} servers agentStore
   agentAsync <- newTVarIO Nothing
@@ -196,6 +199,8 @@ newChatController ChatDatabase {chatStore, agentStore} user cfg@ChatConfig {agen
   sndFiles <- newTVarIO M.empty
   rcvFiles <- newTVarIO M.empty
   currentCalls <- atomically TM.empty
+  remoteHostSessions <- atomically TM.empty
+  remoteCtrlSession <- newTVarIO Nothing
   filesFolder <- newTVarIO optFilesFolder
   chatStoreChanged <- newTVarIO False
   expireCIThreads <- newTVarIO M.empty
@@ -208,8 +213,10 @@ newChatController ChatDatabase {chatStore, agentStore} user cfg@ChatConfig {agen
   contactMergeEnabled <- newTVarIO True
   pure
     ChatController
-      { firstTime,
+      {
+        firstTime,
         currentUser,
+        currentRemoteHost,
         smpAgent,
         agentAsync,
         chatStore,
@@ -222,6 +229,8 @@ newChatController ChatDatabase {chatStore, agentStore} user cfg@ChatConfig {agen
         sndFiles,
         rcvFiles,
         currentCalls,
+        remoteHostSessions,
+        remoteCtrlSession,
         config,
         filesFolder,
         expireCIThreads,
@@ -344,7 +353,9 @@ restoreCalls = do
   atomically $ writeTVar calls callsMap
 
 stopChatController :: forall m. MonadUnliftIO m => ChatController -> m ()
-stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags} = do
+stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags, remoteHostSessions, remoteCtrlSession} = do
+  readTVarIO remoteHostSessions >>= mapM_ cancelRemoteHostSession
+  readTVarIO remoteCtrlSession >>= mapM_ cancelRemoteCtrlSession_
   disconnectAgentClient smpAgent
   readTVarIO s >>= mapM_ (\(a1, a2) -> uninterruptibleCancel a1 >> mapM_ uninterruptibleCancel a2)
   closeFiles sndFiles
@@ -360,12 +371,14 @@ stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles,
       mapM_ hClose fs
       atomically $ writeTVar files M.empty
 
-execChatCommand :: ChatMonad' m => ByteString -> m ChatResponse
-execChatCommand s = do
+execChatCommand :: ChatMonad' m => Maybe RemoteHostId -> ByteString -> m ChatResponse
+execChatCommand rh s = do
   u <- readTVarIO =<< asks currentUser
   case parseChatCommand s of
     Left e -> pure $ chatCmdError u e
-    Right cmd -> execChatCommand_ u cmd
+    Right cmd -> case rh of
+      Just remoteHostId | allowRemoteCommand cmd -> execRemoteCommand u remoteHostId (s, cmd)
+      _ -> execChatCommand_ u cmd
 
 execChatCommand' :: ChatMonad' m => ChatCommand -> m ChatResponse
 execChatCommand' cmd = asks currentUser >>= readTVarIO >>= (`execChatCommand_` cmd)
@@ -373,9 +386,13 @@ execChatCommand' cmd = asks currentUser >>= readTVarIO >>= (`execChatCommand_` c
 execChatCommand_ :: ChatMonad' m => Maybe User -> ChatCommand -> m ChatResponse
 execChatCommand_ u cmd = either (CRChatCmdError u) id <$> runExceptT (processChatCommand cmd)
 
+execRemoteCommand :: ChatMonad' m => Maybe User -> RemoteHostId -> (ByteString, ChatCommand) -> m ChatResponse
+execRemoteCommand u rh scmd = either (CRChatCmdError u) id <$> runExceptT (withRemoteHostSession rh $ \rhs -> processRemoteCommand rhs scmd)
+
 parseChatCommand :: ByteString -> Either String ChatCommand
 parseChatCommand = A.parseOnly chatCommandP . B.dropWhileEnd isSpace
 
+-- | Chat API commands interpreted in context of a local zone
 processChatCommand :: forall m. ChatMonad m => ChatCommand -> m ChatResponse
 processChatCommand = \case
   ShowActiveUser -> withUser' $ pure . CRActiveUser
@@ -1859,6 +1876,18 @@ processChatCommand = \case
     let pref = uncurry TimedMessagesGroupPreference $ maybe (FEOff, Just 86400) (\ttl -> (FEOn, Just ttl)) ttl_
     updateGroupProfileByName gName $ \p ->
       p {groupPreferences = Just . setGroupPreference' SGFTimedMessages pref $ groupPreferences p}
+  CreateRemoteHost -> createRemoteHost
+  ListRemoteHosts -> listRemoteHosts
+  StartRemoteHost rh -> startRemoteHost rh
+  StopRemoteHost rh -> closeRemoteHostSession rh
+  DeleteRemoteHost rh -> deleteRemoteHost rh
+  StartRemoteCtrl -> startRemoteCtrl (execChatCommand Nothing)
+  AcceptRemoteCtrl rc -> acceptRemoteCtrl rc
+  RejectRemoteCtrl rc -> rejectRemoteCtrl rc
+  StopRemoteCtrl -> stopRemoteCtrl
+  RegisterRemoteCtrl oob -> registerRemoteCtrl oob
+  ListRemoteCtrls -> listRemoteCtrls
+  DeleteRemoteCtrl rc -> deleteRemoteCtrl rc
   QuitChat -> liftIO exitSuccess
   ShowVersion -> do
     let versionInfo = coreVersionInfo $(simplexmqCommitQ)
@@ -5737,6 +5766,19 @@ chatCommandP =
       "/set disappear @" *> (SetContactTimedMessages <$> displayName <*> optional (A.space *> timedMessagesEnabledP)),
       "/set disappear " *> (SetUserTimedMessages <$> (("yes" $> True) <|> ("no" $> False))),
       ("/incognito" <* optional (A.space *> onOffP)) $> ChatHelp HSIncognito,
+      "/create remote host" $> CreateRemoteHost,
+      "/list remote hosts" $> ListRemoteHosts,
+      "/start remote host " *> (StartRemoteHost <$> A.decimal),
+      "/stop remote host " *> (StopRemoteHost <$> A.decimal),
+      "/delete remote host " *> (DeleteRemoteHost <$> A.decimal),
+      "/start remote ctrl" $> StartRemoteCtrl,
+      -- TODO *** you need to pass multiple parameters here
+      "/register remote ctrl " *> (RegisterRemoteCtrl <$> (RemoteCtrlOOB <$> strP)),
+      "/list remote ctrls" $> ListRemoteCtrls,
+      "/accept remote ctrl " *> (AcceptRemoteCtrl <$> A.decimal),
+      "/reject remote ctrl " *> (RejectRemoteCtrl <$> A.decimal),
+      "/stop remote ctrl" $> StopRemoteCtrl,
+      "/delete remote ctrl " *> (DeleteRemoteCtrl <$> A.decimal),
       ("/quit" <|> "/q" <|> "/exit") $> QuitChat,
       ("/version" <|> "/v") $> ShowVersion,
       "/debug locks" $> DebugLocks,

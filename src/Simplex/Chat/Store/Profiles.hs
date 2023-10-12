@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE NamedFieldPuns #-}
@@ -56,7 +57,8 @@ module Simplex.Chat.Store.Profiles
 where
 
 import Control.Monad.Except
-import Data.Aeson (ToJSON)
+import Control.Monad.IO.Class
+import Data.Aeson (FromJSON, ToJSON)
 import qualified Data.Aeson as J
 import Data.Functor (($>))
 import Data.Int (Int64)
@@ -395,7 +397,7 @@ data UserContactLink = UserContactLink
   { connReqContact :: ConnReqContact,
     autoAccept :: Maybe AutoAccept
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON UserContactLink where toEncoding = J.genericToEncoding J.defaultOptions
 
@@ -403,7 +405,7 @@ data AutoAccept = AutoAccept
   { acceptIncognito :: IncognitoEnabled,
     autoReply :: Maybe MsgContent
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON AutoAccept where toEncoding = J.genericToEncoding J.defaultOptions
 

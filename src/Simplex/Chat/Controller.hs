@@ -1,4 +1,5 @@
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
@@ -12,6 +13,7 @@
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE StrictData #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Simplex.Chat.Controller where
 
@@ -24,11 +26,13 @@ import Control.Monad.Reader
 import Crypto.Random (ChaChaDRG)
 import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.:?))
 import qualified Data.Aeson as J
+import qualified Data.Aeson.TH  as JQ
 import qualified Data.Aeson.Types as JT
 import qualified Data.Attoparsec.ByteString.Char8 as A
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as B
 import Data.Char (ord)
+import Data.Constraint (Dict (..))
 import Data.Int (Int64)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
@@ -45,6 +49,7 @@ import Simplex.Chat.Markdown (MarkdownList)
 import Simplex.Chat.Messages
 import Simplex.Chat.Messages.CIContent
 import Simplex.Chat.Protocol
+import Simplex.Chat.Remote.Types
 import Simplex.Chat.Store (AutoAccept, StoreError (..), UserContactLink, UserMsgReceiptSettings)
 import Simplex.Chat.Types
 import Simplex.Chat.Types.Preferences
@@ -62,10 +67,11 @@ import qualified Simplex.Messaging.Crypto.File as CF
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Notifications.Protocol (DeviceToken (..), NtfTknStatus)
 import Simplex.Messaging.Parsers (dropPrefix, enumJSON, parseAll, parseString, sumTypeJSON)
-import Simplex.Messaging.Protocol (AProtoServerWithAuth, AProtocolType, CorrId, MsgFlags, NtfServer, ProtoServerWithAuth, ProtocolTypeI, QueueId, SProtocolType, SubscriptionMode (..), UserProtocol, XFTPServerWithAuth)
+import Simplex.Messaging.Protocol (AProtoServerWithAuth, AProtocolType (..), CorrId, MsgFlags, NtfServer, ProtoServerWithAuth, ProtocolTypeI, QueueId, SProtocolType, SubscriptionMode (..), UserProtocol, XFTPServerWithAuth, userProtocol)
 import Simplex.Messaging.TMap (TMap)
 import Simplex.Messaging.Transport (simplexMQVersion)
 import Simplex.Messaging.Transport.Client (TransportHost)
+import Simplex.Messaging.Transport.HTTP2.Client (HTTP2Client)
 import Simplex.Messaging.Util (allFinally, catchAllErrors, liftEitherError, tryAllErrors, (<$$>))
 import Simplex.Messaging.Version
 import System.IO (Handle)
@@ -156,6 +162,7 @@ data ChatDatabase = ChatDatabase {chatStore :: SQLiteStore, agentStore :: SQLite
 
 data ChatController = ChatController
   { currentUser :: TVar (Maybe User),
+    currentRemoteHost :: TVar (Maybe RemoteHostId),
     firstTime :: Bool,
     smpAgent :: AgentClient,
     agentAsync :: TVar (Maybe (Async (), Maybe (Async ()))),
@@ -163,12 +170,14 @@ data ChatController = ChatController
     chatStoreChanged :: TVar Bool, -- if True, chat should be fully restarted
     idsDrg :: TVar ChaChaDRG,
     inputQ :: TBQueue String,
-    outputQ :: TBQueue (Maybe CorrId, ChatResponse),
+    outputQ :: TBQueue (Maybe CorrId, Maybe RemoteHostId, ChatResponse),
     subscriptionMode :: TVar SubscriptionMode,
     chatLock :: Lock,
     sndFiles :: TVar (Map Int64 Handle),
     rcvFiles :: TVar (Map Int64 Handle),
     currentCalls :: TMap ContactId Call,
+    remoteHostSessions :: TMap RemoteHostId RemoteHostSession, -- All the active remote hosts
+    remoteCtrlSession :: TVar (Maybe RemoteCtrlSession), -- Supervisor process for hosted controllers
     config :: ChatConfig,
     filesFolder :: TVar (Maybe FilePath), -- path to files folder for mobile apps,
     expireCIThreads :: TMap UserId (Maybe (Async ())),
@@ -184,6 +193,9 @@ data ChatController = ChatController
 
 data HelpSection = HSMain | HSFiles | HSGroups | HSContacts | HSMyAddress | HSIncognito | HSMarkdown | HSMessages | HSSettings | HSDatabase
   deriving (Show, Generic)
+
+instance FromJSON HelpSection where
+  parseJSON = J.genericParseJSON . enumJSON $ dropPrefix "HS"
 
 instance ToJSON HelpSection where
   toJSON = J.genericToJSON . enumJSON $ dropPrefix "HS"
@@ -403,6 +415,19 @@ data ChatCommand
   | SetUserTimedMessages Bool -- UserId (not used in UI)
   | SetContactTimedMessages ContactName (Maybe TimedMessagesEnabled)
   | SetGroupTimedMessages GroupName (Maybe Int)
+  | CreateRemoteHost -- ^ Configure a new remote host
+  | ListRemoteHosts
+  | StartRemoteHost RemoteHostId -- ^ Start and announce a remote host
+  -- | SwitchRemoteHost (Maybe RemoteHostId) -- ^ Switch current remote host
+  | StopRemoteHost RemoteHostId -- ^ Shut down a running session
+  | DeleteRemoteHost RemoteHostId -- ^ Unregister remote host and remove its data
+  | RegisterRemoteCtrl RemoteCtrlOOB -- ^ Register OOB data for satellite discovery and handshake
+  | StartRemoteCtrl -- ^ Start listening for announcements from all registered controllers
+  | ListRemoteCtrls
+  | AcceptRemoteCtrl RemoteCtrlId -- ^ Accept discovered data and store confirmation
+  | RejectRemoteCtrl RemoteCtrlId -- ^ Reject and blacklist discovered data
+  | StopRemoteCtrl -- ^ Stop listening for announcements or terminate an active session
+  | DeleteRemoteCtrl RemoteCtrlId -- ^ Remove all local data associated with a satellite session
   | QuitChat
   | ShowVersion
   | DebugLocks
@@ -411,6 +436,29 @@ data ChatCommand
   | GetAgentSubs
   | GetAgentSubsDetails
   deriving (Show)
+
+allowRemoteCommand :: ChatCommand -> Bool -- XXX: consider using Relay/Block/ForceLocal
+allowRemoteCommand = \case
+  StartChat {} -> False
+  APIStopChat -> False
+  APIActivateChat -> False
+  APISuspendChat {} -> False
+  SetTempFolder {} -> False
+  QuitChat -> False
+  CreateRemoteHost -> False
+  ListRemoteHosts -> False
+  StartRemoteHost {} -> False
+  -- SwitchRemoteHost {} -> False
+  StopRemoteHost {} -> False
+  DeleteRemoteHost {} -> False
+  RegisterRemoteCtrl {} -> False
+  StartRemoteCtrl -> False
+  ListRemoteCtrls -> False
+  AcceptRemoteCtrl {} -> False
+  RejectRemoteCtrl {} -> False
+  StopRemoteCtrl -> False
+  DeleteRemoteCtrl {} -> False
+  _ -> True
 
 data ChatResponse
   = CRActiveUser {user :: User}
@@ -575,6 +623,23 @@ data ChatResponse
   | CRNtfMessages {user_ :: Maybe User, connEntity :: Maybe ConnectionEntity, msgTs :: Maybe UTCTime, ntfMessages :: [NtfMsgInfo]}
   | CRNewContactConnection {user :: User, connection :: PendingContactConnection}
   | CRContactConnectionDeleted {user :: User, connection :: PendingContactConnection}
+  | CRRemoteHostCreated {remoteHostId :: RemoteHostId, oobData :: RemoteCtrlOOB}
+  | CRRemoteHostList {remoteHosts :: [RemoteHostInfo]} -- XXX: RemoteHostInfo is mostly concerned with session setup
+  | CRRemoteHostStarted {remoteHostId :: RemoteHostId}
+  | CRRemoteHostConnected {remoteHostId :: RemoteHostId}
+  | CRRemoteHostStopped {remoteHostId :: RemoteHostId}
+  | CRRemoteHostDeleted {remoteHostId :: RemoteHostId}
+  | CRRemoteCtrlList {remoteCtrls :: [RemoteCtrlInfo]}
+  | CRRemoteCtrlRegistered {remoteCtrlId :: RemoteCtrlId}
+  | CRRemoteCtrlStarted
+  | CRRemoteCtrlAnnounce {fingerprint :: C.KeyHash} -- unregistered fingerprint, needs confirmation
+  | CRRemoteCtrlFound {remoteCtrl :: RemoteCtrl} -- registered fingerprint, may connect
+  | CRRemoteCtrlAccepted {remoteCtrlId :: RemoteCtrlId}
+  | CRRemoteCtrlRejected {remoteCtrlId :: RemoteCtrlId}
+  | CRRemoteCtrlConnecting {remoteCtrlId :: RemoteCtrlId, displayName :: Text}
+  | CRRemoteCtrlConnected {remoteCtrlId :: RemoteCtrlId, displayName :: Text}
+  | CRRemoteCtrlStopped
+  | CRRemoteCtrlDeleted {remoteCtrlId :: RemoteCtrlId}
   | CRSQLResult {rows :: [Text]}
   | CRSlowSQLQueries {chatQueries :: [SlowSQLQuery], agentQueries :: [SlowSQLQuery]}
   | CRDebugLocks {chatLockName :: Maybe String, agentLocks :: AgentLocks}
@@ -590,7 +655,28 @@ data ChatResponse
   | CRChatError {user_ :: Maybe User, chatError :: ChatError}
   | CRArchiveImported {archiveErrors :: [ArchiveError]}
   | CRTimedAction {action :: String, durationMilliseconds :: Int64}
-  deriving (Show, Generic)
+  deriving (Show)
+
+allowRemoteEvent :: ChatResponse -> Bool
+allowRemoteEvent = \case
+  CRRemoteHostCreated {} -> False
+  CRRemoteHostList {} -> False
+  CRRemoteHostStarted {} -> False
+  CRRemoteHostConnected {} -> False
+  CRRemoteHostStopped {} -> False
+  CRRemoteHostDeleted {} -> False
+  CRRemoteCtrlList {} -> False
+  CRRemoteCtrlRegistered {} -> False
+  CRRemoteCtrlStarted {} -> False
+  CRRemoteCtrlAnnounce {} -> False
+  CRRemoteCtrlFound {} -> False
+  CRRemoteCtrlAccepted {} -> False
+  CRRemoteCtrlRejected {} -> False
+  CRRemoteCtrlConnecting {} -> False
+  CRRemoteCtrlConnected {} -> False
+  CRRemoteCtrlStopped {} -> False
+  CRRemoteCtrlDeleted {} -> False
+  _ -> True
 
 logResponseToFile :: ChatResponse -> Bool
 logResponseToFile = \case
@@ -611,15 +697,40 @@ logResponseToFile = \case
   CRMessageError {} -> True
   _ -> False
 
-instance ToJSON ChatResponse where
-  toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "CR"
-  toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "CR"
+data RemoteCtrlOOB = RemoteCtrlOOB
+  { caFingerprint :: C.KeyHash
+  }
+  deriving (Show, Generic, FromJSON)
+
+instance ToJSON RemoteCtrlOOB where toEncoding = J.genericToEncoding J.defaultOptions
+
+data RemoteHostInfo = RemoteHostInfo
+  { remoteHostId :: RemoteHostId,
+    storePath :: FilePath,
+    displayName :: Text,
+    sessionActive :: Bool
+  }
+  deriving (Show, Generic, FromJSON)
+
+instance ToJSON RemoteHostInfo where toEncoding = J.genericToEncoding J.defaultOptions
+
+data RemoteCtrlInfo = RemoteCtrlInfo
+  { remoteCtrlId :: RemoteCtrlId,
+    displayName :: Text,
+    sessionActive :: Bool
+  }
+  deriving (Eq, Show, Generic, FromJSON)
+
+instance ToJSON RemoteCtrlInfo where toEncoding = J.genericToEncoding J.defaultOptions
 
 data ConnectionPlan
   = CPInvitationLink {invitationLinkPlan :: InvitationLinkPlan}
   | CPContactAddress {contactAddressPlan :: ContactAddressPlan}
   | CPGroupLink {groupLinkPlan :: GroupLinkPlan}
   deriving (Show, Generic)
+
+instance FromJSON ConnectionPlan where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "CP"
 
 instance ToJSON ConnectionPlan where
   toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "CP"
@@ -632,6 +743,9 @@ data InvitationLinkPlan
   | ILPKnown {contact :: Contact}
   deriving (Show, Generic)
 
+instance FromJSON InvitationLinkPlan where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "ILP"
+
 instance ToJSON InvitationLinkPlan where
   toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "ILP"
   toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "ILP"
@@ -643,6 +757,9 @@ data ContactAddressPlan
   | CAPKnown {contact :: Contact}
   deriving (Show, Generic)
 
+instance FromJSON ContactAddressPlan where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "CAP"
+
 instance ToJSON ContactAddressPlan where
   toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "CAP"
   toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "CAP"
@@ -653,6 +770,9 @@ data GroupLinkPlan
   | GLPConnecting {groupInfo_ :: Maybe GroupInfo}
   | GLPKnown {groupInfo :: GroupInfo}
   deriving (Show, Generic)
+
+instance FromJSON GroupLinkPlan where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "GLP"
 
 instance ToJSON GroupLinkPlan where
   toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "GLP"
@@ -691,6 +811,9 @@ instance StrEncoding AgentQueueId where
   strDecode s = AgentQueueId <$> strDecode s
   strP = AgentQueueId <$> strP
 
+instance FromJSON AgentQueueId where
+  parseJSON = strParseJSON "AgentQueueId"
+
 instance ToJSON AgentQueueId where
   toJSON = strToJSON
   toEncoding = strToJEncoding
@@ -709,11 +832,22 @@ data UserProtoServers p = UserProtoServers
   }
   deriving (Show, Generic)
 
+instance ProtocolTypeI p => FromJSON (UserProtoServers p) where
+  parseJSON = J.genericParseJSON J.defaultOptions
+
 instance ProtocolTypeI p => ToJSON (UserProtoServers p) where
-  toJSON = J.genericToJSON J.defaultOptions
   toEncoding = J.genericToEncoding J.defaultOptions
 
 data AUserProtoServers = forall p. (ProtocolTypeI p, UserProtocol p) => AUPS (UserProtoServers p)
+
+instance FromJSON AUserProtoServers where
+  parseJSON v = J.withObject "AUserProtoServers" parse v
+    where
+      parse o = do
+        AProtocolType (p :: SProtocolType p) <- o .: "serverProtocol"
+        case userProtocol p of
+          Just Dict -> AUPS <$> J.parseJSON @(UserProtoServers p) v
+          Nothing -> fail $ "AUserProtoServers: unsupported protocol " <> show p
 
 instance ToJSON AUserProtoServers where
   toJSON (AUPS s) = J.genericToJSON J.defaultOptions s
@@ -743,7 +877,7 @@ data ContactSubStatus = ContactSubStatus
   { contact :: Contact,
     contactError :: Maybe ChatError
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON ContactSubStatus where
   toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
@@ -753,7 +887,7 @@ data MemberSubStatus = MemberSubStatus
   { member :: GroupMember,
     memberError :: Maybe ChatError
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON MemberSubStatus where
   toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
@@ -763,7 +897,7 @@ data UserContactSubStatus = UserContactSubStatus
   { userContact :: UserContact,
     userContactError :: Maybe ChatError
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON UserContactSubStatus where
   toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
@@ -773,7 +907,7 @@ data PendingSubStatus = PendingSubStatus
   { connection :: PendingContactConnection,
     connError :: Maybe ChatError
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON PendingSubStatus where
   toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
@@ -785,7 +919,7 @@ data UserProfileUpdateSummary = UserProfileUpdateSummary
     updateFailures :: Int,
     changedContacts :: [Contact]
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON UserProfileUpdateSummary where toEncoding = J.genericToEncoding J.defaultOptions
 
@@ -821,12 +955,10 @@ data XFTPFileConfig = XFTPFileConfig
 defaultXFTPFileConfig :: XFTPFileConfig
 defaultXFTPFileConfig = XFTPFileConfig {minFileSize = 0}
 
-instance ToJSON XFTPFileConfig where
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
+instance ToJSON XFTPFileConfig where toEncoding = J.genericToEncoding J.defaultOptions
 
 data NtfMsgInfo = NtfMsgInfo {msgTs :: UTCTime, msgFlags :: MsgFlags}
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON NtfMsgInfo where toEncoding = J.genericToEncoding J.defaultOptions
 
@@ -838,7 +970,7 @@ data SwitchProgress = SwitchProgress
     switchPhase :: SwitchPhase,
     connectionStats :: ConnectionStats
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON SwitchProgress where toEncoding = J.genericToEncoding J.defaultOptions
 
@@ -846,7 +978,7 @@ data RatchetSyncProgress = RatchetSyncProgress
   { ratchetSyncStatus :: RatchetSyncState,
     connectionStats :: ConnectionStats
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON RatchetSyncProgress where toEncoding = J.genericToEncoding J.defaultOptions
 
@@ -854,7 +986,7 @@ data ParsedServerAddress = ParsedServerAddress
   { serverAddress :: Maybe ServerAddress,
     parseError :: String
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON ParsedServerAddress where toEncoding = J.genericToEncoding J.defaultOptions
 
@@ -865,7 +997,7 @@ data ServerAddress = ServerAddress
     keyHash :: String,
     basicAuth :: String
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON ServerAddress where toEncoding = J.genericToEncoding J.defaultOptions
 
@@ -889,7 +1021,7 @@ data CoreVersionInfo = CoreVersionInfo
     simplexmqVersion :: String,
     simplexmqCommit :: String
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON CoreVersionInfo where toEncoding = J.genericToEncoding J.defaultOptions
 
@@ -902,7 +1034,7 @@ data SlowSQLQuery = SlowSQLQuery
   { query :: Text,
     queryStats :: SlowQueryStats
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, FromJSON)
 
 instance ToJSON SlowSQLQuery where toEncoding = J.genericToEncoding J.defaultOptions
 
@@ -911,7 +1043,12 @@ data ChatError
   | ChatErrorAgent {agentError :: AgentErrorType, connectionEntity_ :: Maybe ConnectionEntity}
   | ChatErrorStore {storeError :: StoreError}
   | ChatErrorDatabase {databaseError :: DatabaseError}
+  | ChatErrorRemoteCtrl {remoteCtrlError :: RemoteCtrlError}
+  | ChatErrorRemoteHost {remoteHostId :: RemoteHostId, remoteHostError :: RemoteHostError}
   deriving (Show, Exception, Generic)
+
+instance FromJSON ChatError where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "Chat"
 
 instance ToJSON ChatError where
   toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "Chat"
@@ -997,6 +1134,9 @@ data ChatErrorType
   | CEException {message :: String}
   deriving (Show, Exception, Generic)
 
+instance FromJSON ChatErrorType where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "CE"
+
 instance ToJSON ChatErrorType where
   toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "CE"
   toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "CE"
@@ -1009,12 +1149,18 @@ data DatabaseError
   | DBErrorOpen {sqliteError :: SQLiteError}
   deriving (Show, Exception, Generic)
 
+instance FromJSON DatabaseError where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "DB"
+
 instance ToJSON DatabaseError where
   toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "DB"
   toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "DB"
 
 data SQLiteError = SQLiteErrorNotADatabase | SQLiteError String
   deriving (Show, Exception, Generic)
+
+instance FromJSON SQLiteError where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "SQLite"
 
 instance ToJSON SQLiteError where
   toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "SQLite"
@@ -1023,14 +1169,74 @@ instance ToJSON SQLiteError where
 throwDBError :: ChatMonad m => DatabaseError -> m ()
 throwDBError = throwError . ChatErrorDatabase
 
+-- TODO review errors, some of it can be covered by HTTP2 errors
+data RemoteHostError
+  = RHMissing -- ^ No remote session matches this identifier
+  | RHBusy -- ^ A session is already running
+  | RHRejected -- ^ A session attempt was rejected by a host
+  | RHTimeout -- ^ A discovery or a remote operation has timed out
+  | RHDisconnected {reason :: Text} -- ^ A session disconnected by a host
+  | RHConnectionLost {reason :: Text} -- ^ A session disconnected due to transport issues
+  deriving (Show, Exception, Generic)
+
+instance FromJSON RemoteHostError where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "RH"
+
+instance ToJSON RemoteHostError where
+  toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "RH"
+  toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "RH"
+
+-- TODO review errors, some of it can be covered by HTTP2 errors
+data RemoteCtrlError
+  = RCEMissing {remoteCtrlId :: RemoteCtrlId} -- ^ No remote session matches this identifier
+  | RCEInactive -- ^ No session is running
+  | RCEBusy -- ^ A session is already running
+  | RCETimeout -- ^ Remote operation timed out
+  | RCEDisconnected {remoteCtrlId :: RemoteCtrlId, reason :: Text} -- ^ A session disconnected by a controller
+  | RCEConnectionLost {remoteCtrlId :: RemoteCtrlId, reason :: Text} -- ^ A session disconnected due to transport issues
+  | RCECertificateExpired {remoteCtrlId :: RemoteCtrlId} -- ^ A connection or CA certificate in a chain have bad validity period
+  | RCECertificateUntrusted {remoteCtrlId :: RemoteCtrlId} -- ^ TLS is unable to validate certificate chain presented for a connection
+  | RCEBadFingerprint -- ^ Bad fingerprint data provided in OOB
+  deriving (Show, Exception, Generic)
+
+instance FromJSON RemoteCtrlError where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "RCE"
+
+instance ToJSON RemoteCtrlError where
+  toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "RCE"
+  toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "RCE"
+
 data ArchiveError
   = AEImport {chatError :: ChatError}
   | AEImportFile {file :: String, chatError :: ChatError}
   deriving (Show, Exception, Generic)
 
+instance FromJSON ArchiveError where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "AE"
+
 instance ToJSON ArchiveError where
   toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "AE"
   toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "AE"
+
+data RemoteHostSession
+  = RemoteHostSessionStarting
+      { announcer :: Async ()
+      }
+  | RemoteHostSessionStarted
+      { -- | Path for local resources to be synchronized with host
+        storePath :: FilePath,
+        ctrlClient :: HTTP2Client
+      }
+
+data RemoteCtrlSession = RemoteCtrlSession
+  { -- | Server side of transport to process remote commands and forward notifications
+    discoverer :: Async (),
+    supervisor :: Async (),
+    hostServer :: Maybe (Async ()),
+    discovered :: TMap C.KeyHash TransportHost,
+    accepted :: TMVar RemoteCtrlId,
+    remoteOutputQ :: TBQueue ChatResponse
+  }
 
 type ChatMonad' m = (MonadUnliftIO m, MonadReader ChatController m)
 
@@ -1043,6 +1249,10 @@ chatReadVar f = asks f >>= readTVarIO
 chatWriteVar :: ChatMonad' m => (ChatController -> TVar a) -> a -> m ()
 chatWriteVar f value = asks f >>= atomically . (`writeTVar` value)
 {-# INLINE chatWriteVar #-}
+
+chatModifyVar :: ChatMonad' m => (ChatController -> TVar a) -> (a -> a) -> m ()
+chatModifyVar f newValue = asks f >>= atomically . (`modifyTVar'` newValue)
+{-# INLINE chatModifyVar #-}
 
 tryChatError :: ChatMonad m => m a -> m (Either ChatError a)
 tryChatError = tryAllErrors mkChatError
@@ -1063,10 +1273,21 @@ mkChatError = ChatError . CEException . show
 chatCmdError :: Maybe User -> String -> ChatResponse
 chatCmdError user = CRChatCmdError user . ChatError . CECommandError
 
+-- | Emit local events.
 toView :: ChatMonad' m => ChatResponse -> m ()
 toView event = do
-  q <- asks outputQ
-  atomically $ writeTBQueue q (Nothing, event)
+  localQ <- asks outputQ
+  chatReadVar remoteCtrlSession >>= \case
+    Nothing -> atomically $ writeTBQueue localQ (Nothing, Nothing, event)
+    Just RemoteCtrlSession {remoteOutputQ} ->
+      if allowRemoteEvent event
+        then do
+          -- TODO: filter events or let the UI ignore trigger events by itself?
+          -- traceM $ "Sending event to remote Q: " <> show event
+          atomically $ writeTBQueue remoteOutputQ event -- TODO: check full?
+        else do
+          -- traceM $ "Sending event to local Q: " <> show event
+          atomically $ writeTBQueue localQ (Nothing, Nothing, event)
 
 withStore' :: ChatMonad m => (DB.Connection -> IO a) -> m a
 withStore' action = withStore $ liftIO . action
@@ -1094,3 +1315,5 @@ withStoreCtx ctx_ action = do
   where
     handleInternal :: String -> SomeException -> IO (Either StoreError a)
     handleInternal ctxStr e = pure . Left . SEInternalError $ show e <> ctxStr
+
+$(JQ.deriveJSON (sumTypeJSON $ dropPrefix "CR") ''ChatResponse)
