@@ -1,6 +1,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -26,6 +27,7 @@ import qualified Data.Binary.Builder as Binary
 import Data.ByteString (ByteString, hPut)
 import qualified Data.ByteString.Base64.URL as B64U
 import qualified Data.ByteString.Char8 as B
+import qualified Data.ByteString.Lazy.Char8 as LB
 import Data.Int (Int64)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as M
@@ -196,7 +198,7 @@ processRemoteCommand RemoteHostSessionStarted {ctrlClient} (s, cmd) = do
         Nothing -> pure . CRChatError Nothing . ChatError $ CEInternalError "failed to store file on remote host"
         Just hostPath -> do
           let cm' = cm {fileSource = Just CryptoFile {filePath = hostPath, cryptoArgs}} :: ComposedMessage
-          relayCommand ctrlClient $ B.takeWhile (/= '{') s <> B.toStrict (J.encode cm')
+          relayCommand ctrlClient $ B.takeWhile (/= '{') s <> LB.toStrict (J.encode cm')
     _ -> relayCommand ctrlClient s
 
 relayCommand :: (ChatMonad m) => HTTP2Client -> ByteString -> m ChatResponse
