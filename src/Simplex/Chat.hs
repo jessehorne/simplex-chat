@@ -2267,6 +2267,7 @@ processChatCommand = \case
             ( CRInvitationUri crData {crScheme = CRSSimplex} e2e,
               CRInvitationUri crData {crScheme = simplexChat} e2e
             )
+          _ -> (cReq, cReq) -- ghc8107
     connectPlan user (ACR SCMContact cReq) = do
       let CRContactUri ConnReqUriData {crClientData} = cReq
           groupLinkId = crClientData >>= decodeJSON >>= \(CRDataGroup gli) -> Just gli
@@ -2310,6 +2311,7 @@ processChatCommand = \case
             ( CRContactUri crData {crScheme = CRSSimplex},
               CRContactUri crData {crScheme = simplexChat}
             )
+          _ -> (cReq, cReq) -- ghc8107
         cReqHashes :: (ConnReqUriHash, ConnReqUriHash)
         cReqHashes = bimap hash hash cReqSchemas
         hash = ConnReqUriHash . C.sha256Hash . strEncode
