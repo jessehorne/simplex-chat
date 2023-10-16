@@ -212,7 +212,7 @@ processRemoteCommand RemoteHostSessionStarted {ctrlClient} (s, cmd) =
         hostPath <- storeRemoteFile ctrlClient ctrlPath
         let cm' = cm {fileSource = Just CryptoFile {filePath = hostPath, cryptoArgs}} :: ComposedMessage
         -- TODO we shouldn't manipulate JSON like that
-        pure $ B.takeWhile (/= '{') s <> B.toStrict (J.encode cm')
+        pure $ B.takeWhile (/= '{') s <> LB.toStrict (J.encode cm')
       _ -> pure s
 
 relayCommand :: ChatMonad m => HTTP2Client -> ByteString -> m ChatResponse
