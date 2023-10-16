@@ -179,6 +179,9 @@ data Contact = Contact
 contactConn :: Contact -> Connection
 contactConn Contact {activeConn} = activeConn
 
+contactAgentConnId :: Contact -> AgentConnId
+contactAgentConnId Contact {activeConn = Connection {agentConnId}} = agentConnId
+
 contactConnId :: Contact -> ConnId
 contactConnId = aConnId . contactConn
 
@@ -202,6 +205,9 @@ contactReady Contact {activeConn} = connReady activeConn
 
 contactActive :: Contact -> Bool
 contactActive Contact {contactStatus} = contactStatus == CSActive
+
+contactDeleted :: Contact -> Bool
+contactDeleted Contact {contactStatus} = contactStatus == CSDeleted
 
 contactSecurityCode :: Contact -> Maybe SecurityCode
 contactSecurityCode Contact {activeConn} = connectionCode activeConn
@@ -1138,7 +1144,7 @@ liveRcvFileTransferPath ft = fp <$> liveRcvFileTransferInfo ft
     fp RcvFileInfo {filePath} = filePath
 
 newtype AgentConnId = AgentConnId ConnId
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 instance StrEncoding AgentConnId where
   strEncode (AgentConnId connId) = strEncode connId
@@ -1499,6 +1505,35 @@ serializeIntroStatus = \case
 
 textParseJSON :: TextEncoding a => String -> J.Value -> JT.Parser a
 textParseJSON name = J.withText name $ maybe (fail $ "bad " <> name) pure . textDecode
+
+data NetworkStatus
+  = NSUnknown
+  | NSConnected
+  | NSDisconnected
+  | NSError {connectionError :: String}
+  deriving (Eq, Ord, Show, Generic)
+
+netStatusStr :: NetworkStatus -> String
+netStatusStr = \case
+  NSUnknown -> "unknown"
+  NSConnected -> "connected"
+  NSDisconnected -> "disconnected"
+  NSError e -> "error: " <> e
+
+instance FromJSON NetworkStatus where
+  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "NS"
+
+instance ToJSON NetworkStatus where
+  toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "NS"
+  toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "NS"
+
+data ConnNetworkStatus = ConnNetworkStatus
+  { agentConnId :: AgentConnId,
+    networkStatus :: NetworkStatus
+  }
+  deriving (Show, Generic, FromJSON)
+
+instance ToJSON ConnNetworkStatus where toEncoding = J.genericToEncoding J.defaultOptions
 
 type CommandId = Int64
 
