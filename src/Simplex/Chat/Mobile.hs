@@ -5,6 +5,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 
+{-# OPTIONS_GHC -fobject-code #-}
+
 module Simplex.Chat.Mobile where
 
 import Control.Concurrent.STM
@@ -38,6 +40,7 @@ import Simplex.Chat.Mobile.File
 import Simplex.Chat.Mobile.Shared
 import Simplex.Chat.Mobile.WebRTC
 import Simplex.Chat.Options
+import Simplex.Chat.Remote.Types
 import Simplex.Chat.Store
 import Simplex.Chat.Store.Profiles
 import Simplex.Chat.Types
@@ -58,6 +61,8 @@ foreign export ccall "chat_migrate_init" cChatMigrateInit :: CString -> CString 
 foreign export ccall "chat_close_store" cChatCloseStore :: StablePtr ChatController -> IO CString
 
 foreign export ccall "chat_send_cmd" cChatSendCmd :: StablePtr ChatController -> CString -> IO CJSONString
+
+foreign export ccall "chat_send_remote_cmd" cChatSendRemoteCmd :: StablePtr ChatController -> CInt -> CString -> IO CJSONString
 
 foreign export ccall "chat_recv_msg" cChatRecvMsg :: StablePtr ChatController -> IO CJSONString
 
@@ -110,6 +115,14 @@ cChatSendCmd cPtr cCmd = do
   c <- deRefStablePtr cPtr
   cmd <- B.packCString cCmd
   newCStringFromLazyBS =<< chatSendCmd c cmd
+
+-- | send command to chat (same syntax as in terminal for now)
+cChatSendRemoteCmd :: StablePtr ChatController -> CInt -> CString -> IO CJSONString
+cChatSendRemoteCmd cPtr cRemoteHostId cCmd = do
+  c <- deRefStablePtr cPtr
+  cmd <- B.packCString cCmd
+  let rhId = Just $ fromIntegral cRemoteHostId
+  newCStringFromLazyBS =<< chatSendRemoteCmd c rhId cmd
 
 -- | receive message from chat (blocking)
 cChatRecvMsg :: StablePtr ChatController -> IO CJSONString
@@ -217,13 +230,16 @@ chatCloseStore ChatController {chatStore, smpAgent} = handleErr $ do
 handleErr :: IO () -> IO String
 handleErr a = (a $> "") `catch` (pure . show @SomeException)
   
-chatSendCmd :: ChatController -> ByteString -> IO JSONByteString
-chatSendCmd cc s = J.encode . APIResponse Nothing <$> runReaderT (execChatCommand s) cc
+chatSendCmd :: ChatController -> B.ByteString -> IO JSONByteString
+chatSendCmd cc = chatSendRemoteCmd cc Nothing
+
+chatSendRemoteCmd :: ChatController -> Maybe RemoteHostId -> B.ByteString -> IO JSONByteString
+chatSendRemoteCmd cc rh s = J.encode . APIResponse Nothing rh <$> runReaderT (execChatCommand rh s) cc
 
 chatRecvMsg :: ChatController -> IO JSONByteString
 chatRecvMsg ChatController {outputQ} = json <$> atomically (readTBQueue outputQ)
   where
-    json (corr, resp) = J.encode APIResponse {corr, resp}
+    json (corr, remoteHostId, resp) = J.encode APIResponse {corr, remoteHostId, resp}
 
 chatRecvMsgWait :: ChatController -> Int -> IO JSONByteString
 chatRecvMsgWait cc time = fromMaybe "" <$> timeout time (chatRecvMsg cc)
@@ -249,7 +265,7 @@ chatPasswordHash pwd salt = either (const "") passwordHash salt'
     salt' = U.decode salt
     passwordHash = U.encode . C.sha512Hash . (pwd <>)
 
-data APIResponse = APIResponse {corr :: Maybe CorrId, resp :: ChatResponse}
+data APIResponse = APIResponse {corr :: Maybe CorrId, remoteHostId :: Maybe RemoteHostId, resp :: ChatResponse}
   deriving (Generic)
 
 instance ToJSON APIResponse where

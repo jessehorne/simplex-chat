@@ -57,6 +57,8 @@ import Simplex.Chat.Messages.CIContent
 import Simplex.Chat.Options
 import Simplex.Chat.ProfileGenerator (generateRandomProfile)
 import Simplex.Chat.Protocol
+import Simplex.Chat.Remote
+import Simplex.Chat.Remote.Types
 import Simplex.Chat.Store
 import Simplex.Chat.Store.Connections
 import Simplex.Chat.Store.Direct
@@ -64,6 +66,7 @@ import Simplex.Chat.Store.Files
 import Simplex.Chat.Store.Groups
 import Simplex.Chat.Store.Messages
 import Simplex.Chat.Store.Profiles
+import Simplex.Chat.Store.Remote
 import Simplex.Chat.Store.Shared
 import Simplex.Chat.Types
 import Simplex.Chat.Types.Preferences
@@ -186,6 +189,7 @@ newChatController ChatDatabase {chatStore, agentStore} user cfg@ChatConfig {agen
       config = cfg {logLevel, showReactions, tbqSize, subscriptionEvents = logConnections, hostEvents = logServerHosts, defaultServers = configServers, inlineFiles = inlineFiles', autoAcceptFileSize}
       firstTime = dbNew chatStore
   currentUser <- newTVarIO user
+  currentRemoteHost <- newTVarIO Nothing
   servers <- agentServers config
   smpAgent <- getSMPAgentClient aCfg {tbqSize} servers agentStore
   agentAsync <- newTVarIO Nothing
@@ -198,6 +202,9 @@ newChatController ChatDatabase {chatStore, agentStore} user cfg@ChatConfig {agen
   sndFiles <- newTVarIO M.empty
   rcvFiles <- newTVarIO M.empty
   currentCalls <- atomically TM.empty
+  localDeviceName <- newTVarIO "" -- TODO set in config
+  remoteHostSessions <- atomically TM.empty
+  remoteCtrlSession <- newTVarIO Nothing
   filesFolder <- newTVarIO optFilesFolder
   chatStoreChanged <- newTVarIO False
   expireCIThreads <- newTVarIO M.empty
@@ -211,8 +218,10 @@ newChatController ChatDatabase {chatStore, agentStore} user cfg@ChatConfig {agen
   contactMergeEnabled <- newTVarIO True
   pure
     ChatController
-      { firstTime,
+      {
+        firstTime,
         currentUser,
+        currentRemoteHost,
         smpAgent,
         agentAsync,
         chatStore,
@@ -226,6 +235,9 @@ newChatController ChatDatabase {chatStore, agentStore} user cfg@ChatConfig {agen
         sndFiles,
         rcvFiles,
         currentCalls,
+        localDeviceName,
+        remoteHostSessions,
+        remoteCtrlSession,
         config,
         filesFolder,
         expireCIThreads,
@@ -349,7 +361,9 @@ restoreCalls = do
   atomically $ writeTVar calls callsMap
 
 stopChatController :: forall m. MonadUnliftIO m => ChatController -> m ()
-stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags} = do
+stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags, remoteHostSessions, remoteCtrlSession} = do
+  readTVarIO remoteHostSessions >>= mapM_ cancelRemoteHostSession
+  readTVarIO remoteCtrlSession >>= mapM_ cancelRemoteCtrlSession_
   disconnectAgentClient smpAgent
   readTVarIO s >>= mapM_ (\(a1, a2) -> uninterruptibleCancel a1 >> mapM_ uninterruptibleCancel a2)
   closeFiles sndFiles
@@ -365,12 +379,14 @@ stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles,
       mapM_ hClose fs
       atomically $ writeTVar files M.empty
 
-execChatCommand :: ChatMonad' m => ByteString -> m ChatResponse
-execChatCommand s = do
+execChatCommand :: ChatMonad' m => Maybe RemoteHostId -> ByteString -> m ChatResponse
+execChatCommand rh s = do
   u <- readTVarIO =<< asks currentUser
   case parseChatCommand s of
     Left e -> pure $ chatCmdError u e
-    Right cmd -> execChatCommand_ u cmd
+    Right cmd -> case rh of
+      Just remoteHostId | allowRemoteCommand cmd -> execRemoteCommand u remoteHostId (s, cmd)
+      _ -> execChatCommand_ u cmd
 
 execChatCommand' :: ChatMonad' m => ChatCommand -> m ChatResponse
 execChatCommand' cmd = asks currentUser >>= readTVarIO >>= (`execChatCommand_` cmd)
@@ -378,9 +394,13 @@ execChatCommand' cmd = asks currentUser >>= readTVarIO >>= (`execChatCommand_` c
 execChatCommand_ :: ChatMonad' m => Maybe User -> ChatCommand -> m ChatResponse
 execChatCommand_ u cmd = either (CRChatCmdError u) id <$> runExceptT (processChatCommand cmd)
 
+execRemoteCommand :: ChatMonad' m => Maybe User -> RemoteHostId -> (ByteString, ChatCommand) -> m ChatResponse
+execRemoteCommand u rhId scmd = either (CRChatCmdError u) id <$> runExceptT (getRemoteHostSession rhId >>= (`processRemoteCommand` scmd))
+
 parseChatCommand :: ByteString -> Either String ChatCommand
 parseChatCommand = A.parseOnly chatCommandP . B.dropWhileEnd isSpace
 
+-- | Chat API commands interpreted in context of a local zone
 processChatCommand :: forall m. ChatMonad m => ChatCommand -> m ChatResponse
 processChatCommand = \case
   ShowActiveUser -> withUser' $ pure . CRActiveUser
@@ -1866,6 +1886,19 @@ processChatCommand = \case
     let pref = uncurry TimedMessagesGroupPreference $ maybe (FEOff, Just 86400) (\ttl -> (FEOn, Just ttl)) ttl_
     updateGroupProfileByName gName $ \p ->
       p {groupPreferences = Just . setGroupPreference' SGFTimedMessages pref $ groupPreferences p}
+  SetLocalDeviceName name -> withUser $ \_ -> chatWriteVar localDeviceName name >> ok_
+  CreateRemoteHost -> CRRemoteHostCreated <$> createRemoteHost
+  ListRemoteHosts -> CRRemoteHostList <$> listRemoteHosts
+  StartRemoteHost rh -> startRemoteHost rh >> ok_
+  StopRemoteHost rh -> closeRemoteHostSession rh >> ok_
+  DeleteRemoteHost rh -> deleteRemoteHost rh >> ok_
+  StartRemoteCtrl -> startRemoteCtrl (execChatCommand Nothing) >> ok_
+  RegisterRemoteCtrl oob -> CRRemoteCtrlRegistered <$> withStore' (`insertRemoteCtrl` oob)
+  AcceptRemoteCtrl rc -> acceptRemoteCtrl rc >> ok_
+  RejectRemoteCtrl rc -> rejectRemoteCtrl rc >> ok_
+  StopRemoteCtrl -> stopRemoteCtrl >> ok_
+  ListRemoteCtrls -> CRRemoteCtrlList <$> listRemoteCtrls
+  DeleteRemoteCtrl rc -> deleteRemoteCtrl rc >> ok_
   QuitChat -> liftIO exitSuccess
   ShowVersion -> do
     let versionInfo = coreVersionInfo $(simplexmqCommitQ)
@@ -5143,9 +5176,6 @@ closeFileHandle fileId files = do
   h_ <- atomically . stateTVar fs $ \m -> (M.lookup fileId m, M.delete fileId m)
   liftIO $ mapM_ hClose h_ `catchAll_` pure ()
 
-throwChatError :: ChatMonad m => ChatErrorType -> m a
-throwChatError = throwError . ChatError
-
 deleteMembersConnections :: ChatMonad m => User -> [GroupMember] -> m ()
 deleteMembersConnections user members = do
   let memberConns =
@@ -5804,6 +5834,20 @@ chatCommandP =
       "/set disappear @" *> (SetContactTimedMessages <$> displayName <*> optional (A.space *> timedMessagesEnabledP)),
       "/set disappear " *> (SetUserTimedMessages <$> (("yes" $> True) <|> ("no" $> False))),
       ("/incognito" <* optional (A.space *> onOffP)) $> ChatHelp HSIncognito,
+      "/set device name " *> (SetLocalDeviceName <$> textP),
+      "/create remote host" $> CreateRemoteHost,
+      "/list remote hosts" $> ListRemoteHosts,
+      "/start remote host " *> (StartRemoteHost <$> A.decimal),
+      "/stop remote host " *> (StopRemoteHost <$> A.decimal),
+      "/delete remote host " *> (DeleteRemoteHost <$> A.decimal),
+      "/start remote ctrl" $> StartRemoteCtrl,
+      "/register remote ctrl " *> (RegisterRemoteCtrl <$> (RemoteCtrlOOB <$> strP <* A.space <*> textP)),
+      "/_register remote ctrl " *> (RegisterRemoteCtrl <$> jsonP),
+      "/list remote ctrls" $> ListRemoteCtrls,
+      "/accept remote ctrl " *> (AcceptRemoteCtrl <$> A.decimal),
+      "/reject remote ctrl " *> (RejectRemoteCtrl <$> A.decimal),
+      "/stop remote ctrl" $> StopRemoteCtrl,
+      "/delete remote ctrl " *> (DeleteRemoteCtrl <$> A.decimal),
       ("/quit" <|> "/q" <|> "/exit") $> QuitChat,
       ("/version" <|> "/v") $> ShowVersion,
       "/debug locks" $> DebugLocks,

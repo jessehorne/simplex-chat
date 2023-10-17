@@ -41,6 +41,7 @@ import Simplex.Chat.Markdown
 import Simplex.Chat.Messages hiding (NewChatItem (..))
 import Simplex.Chat.Messages.CIContent
 import Simplex.Chat.Protocol
+import Simplex.Chat.Remote.Types
 import Simplex.Chat.Store (AutoAccept (..), StoreError (..), UserContactLink (..))
 import Simplex.Chat.Styled
 import Simplex.Chat.Types
@@ -64,11 +65,11 @@ import System.Console.ANSI.Types
 
 type CurrentTime = UTCTime
 
-serializeChatResponse :: Maybe User -> CurrentTime -> TimeZone -> ChatResponse -> String
-serializeChatResponse user_ ts tz = unlines . map unStyle . responseToView user_ defaultChatConfig False ts tz
+serializeChatResponse :: (Maybe RemoteHostId, Maybe User) -> CurrentTime -> TimeZone -> Maybe RemoteHostId -> ChatResponse -> String
+serializeChatResponse user_ ts tz remoteHost_ = unlines . map unStyle . responseToView user_ defaultChatConfig False ts tz remoteHost_
 
-responseToView :: Maybe User -> ChatConfig -> Bool -> CurrentTime -> TimeZone -> ChatResponse -> [StyledString]
-responseToView user_ ChatConfig {logLevel, showReactions, showReceipts, testView} liveItems ts tz = \case
+responseToView :: (Maybe RemoteHostId, Maybe User) -> ChatConfig -> Bool -> CurrentTime -> TimeZone -> Maybe RemoteHostId -> ChatResponse -> [StyledString]
+responseToView (currentRH, user_) ChatConfig {logLevel, showReactions, showReceipts, testView} liveItems ts tz outputRH = \case
   CRActiveUser User {profile} -> viewUserProfile $ fromLocalProfile profile
   CRUsersList users -> viewUsersList users
   CRChatStarted -> ["chat started"]
@@ -260,6 +261,17 @@ responseToView user_ ChatConfig {logLevel, showReactions, showReceipts, testView
   CRNtfTokenStatus status -> ["device token status: " <> plain (smpEncode status)]
   CRNtfToken _ status mode -> ["device token status: " <> plain (smpEncode status) <> ", notifications mode: " <> plain (strEncode mode)]
   CRNtfMessages {} -> []
+  CRRemoteHostCreated RemoteHostInfo {remoteHostId, remoteCtrlOOB} -> ("remote host " <> sShow remoteHostId <> " created") : viewRemoteCtrlOOBData remoteCtrlOOB
+  CRRemoteHostList hs -> viewRemoteHosts hs
+  CRRemoteHostConnected RemoteHostInfo {remoteHostId = rhId} -> ["remote host " <> sShow rhId <> " connected"]
+  CRRemoteHostStopped rhId -> ["remote host " <> sShow rhId <> " stopped"]
+  CRRemoteCtrlList cs -> viewRemoteCtrls cs
+  CRRemoteCtrlRegistered RemoteCtrlInfo {remoteCtrlId = rcId} -> ["remote controller " <> sShow rcId <> " registered"]
+  CRRemoteCtrlAnnounce fingerprint -> ["remote controller announced", "connection code:", plain $ strEncode fingerprint]
+  CRRemoteCtrlFound rc -> ["remote controller found:", viewRemoteCtrl rc]
+  CRRemoteCtrlConnecting RemoteCtrlInfo {remoteCtrlId = rcId, displayName = rcName} -> ["remote controller " <> sShow rcId <> " connecting to " <> plain rcName]
+  CRRemoteCtrlConnected RemoteCtrlInfo {remoteCtrlId = rcId, displayName = rcName} -> ["remote controller " <> sShow rcId <> " connected, " <> plain rcName]
+  CRRemoteCtrlStopped -> ["remote controller stopped"]
   CRSQLResult rows -> map plain rows
   CRSlowSQLQueries {chatQueries, agentQueries} ->
     let viewQuery SlowSQLQuery {query, queryStats = SlowQueryStats {count, timeMax, timeAvg}} =
@@ -307,12 +319,14 @@ responseToView user_ ChatConfig {logLevel, showReactions, showReceipts, testView
       | otherwise = []
     ttyUserPrefix :: User -> [StyledString] -> [StyledString]
     ttyUserPrefix _ [] = []
-    ttyUserPrefix User {userId, localDisplayName = u} ss = prependFirst userPrefix ss
+    ttyUserPrefix User {userId, localDisplayName = u} ss
+      | null prefix = ss
+      | otherwise = prependFirst ("[" <> mconcat prefix <> "] ") ss
       where
-        userPrefix = case user_ of
-          Just User {userId = activeUserId} -> if userId /= activeUserId then prefix else ""
-          _ -> prefix
-        prefix = "[user: " <> highlight u <> "] "
+        prefix = intersperse ", " $ remotePrefix <> userPrefix
+        remotePrefix = [maybe "local" (("remote: " <>) . highlight . show) outputRH | outputRH /= currentRH]
+        userPrefix = ["user: " <> highlight u | Just userId /= currentUserId]
+        currentUserId = (\User {userId = uId} -> uId) <$> user_
     ttyUser' :: Maybe User -> [StyledString] -> [StyledString]
     ttyUser' = maybe id ttyUser
     ttyUserPrefix' :: Maybe User -> [StyledString] -> [StyledString]
@@ -1623,6 +1637,31 @@ viewVersionInfo logLevel CoreVersionInfo {version, simplexmqVersion, simplexmqCo
   where
     parens s = " (" <> s <> ")"
 
+viewRemoteCtrlOOBData :: RemoteCtrlOOB -> [StyledString]
+viewRemoteCtrlOOBData RemoteCtrlOOB {fingerprint} =
+  ["connection code:", plain $ strEncode fingerprint]
+
+viewRemoteHosts :: [RemoteHostInfo] -> [StyledString]
+viewRemoteHosts = \case
+  [] -> ["No remote hosts"]
+  hs -> "Remote hosts: " : map viewRemoteHostInfo hs
+  where
+    viewRemoteHostInfo RemoteHostInfo {remoteHostId, displayName, sessionActive} =
+      plain $ tshow remoteHostId <> ". " <> displayName <> if sessionActive then " (active)" else ""
+
+viewRemoteCtrls :: [RemoteCtrlInfo] -> [StyledString]
+viewRemoteCtrls = \case
+  [] -> ["No remote controllers"]
+  hs -> "Remote controllers: " : map viewRemoteCtrlInfo hs
+  where
+    viewRemoteCtrlInfo RemoteCtrlInfo {remoteCtrlId, displayName, sessionActive} =
+      plain $ tshow remoteCtrlId <> ". " <> displayName <> if sessionActive then " (active)" else ""
+
+-- TODO fingerprint, accepted?
+viewRemoteCtrl :: RemoteCtrlInfo -> StyledString
+viewRemoteCtrl RemoteCtrlInfo {remoteCtrlId, displayName} =
+  plain $ tshow remoteCtrlId <> ". " <> displayName
+
 viewChatError :: ChatLogLevel -> ChatError -> [StyledString]
 viewChatError logLevel = \case
   ChatError err -> case err of
@@ -1767,6 +1806,8 @@ viewChatError logLevel = \case
           "[" <> connEntityLabel entity <> ", userContactLinkId: " <> sShow userContactLinkId <> ", connId: " <> cId conn <> "] "
         Nothing -> ""
       cId conn = sShow (connId (conn :: Connection))
+  ChatErrorRemoteCtrl todo'rc -> [sShow todo'rc]
+  ChatErrorRemoteHost remoteHostId todo'rh -> [sShow remoteHostId, sShow todo'rh]
   where
     fileNotFound fileId = ["file " <> sShow fileId <> " not found"]
     sqliteError' = \case

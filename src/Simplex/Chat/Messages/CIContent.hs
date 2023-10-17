@@ -9,12 +9,14 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 
 module Simplex.Chat.Messages.CIContent where
 
 import Data.Aeson (FromJSON, ToJSON)
 import qualified Data.Aeson as J
+import qualified Data.Aeson.TH  as JQ
 import Data.Int (Int64)
 import Data.Text (Text)
 import Data.Text.Encoding (decodeLatin1, encodeUtf8)
@@ -30,7 +32,7 @@ import Simplex.Chat.Types.Util
 import Simplex.Messaging.Agent.Protocol (MsgErrorType (..), RatchetSyncState (..), SwitchPhase (..))
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Parsers (dropPrefix, enumJSON, fstToLower, singleFieldJSON, sumTypeJSON)
-import Simplex.Messaging.Util (safeDecodeUtf8, tshow)
+import Simplex.Messaging.Util (safeDecodeUtf8, tshow, (<$?>))
 
 data MsgDirection = MDRcv | MDSnd
   deriving (Eq, Show, Generic)
@@ -57,6 +59,13 @@ instance TestEquality SMsgDirection where
   testEquality SMDSnd SMDSnd = Just Refl
   testEquality _ _ = Nothing
 
+instance MsgDirectionI d => FromJSON (SMsgDirection d) where
+  parseJSON v = (\(AMsgDirection d) -> checkDirection d) . fromMsgDirection <$?> J.parseJSON v
+
+instance ToJSON (SMsgDirection d) where
+  toJSON = J.toJSON . toMsgDirection
+  toEncoding = J.toEncoding . toMsgDirection
+
 instance ToField (SMsgDirection d) where toField = toField . msgDirectionInt . toMsgDirection
 
 data AMsgDirection = forall d. MsgDirectionI d => AMsgDirection (SMsgDirection d)
@@ -79,6 +88,11 @@ class MsgDirectionI (d :: MsgDirection) where
 instance MsgDirectionI 'MDRcv where msgDirection = SMDRcv
 
 instance MsgDirectionI 'MDSnd where msgDirection = SMDSnd
+
+checkDirection :: forall t d d'. (MsgDirectionI d, MsgDirectionI d') => t d' -> Either String (t d)
+checkDirection x = case testEquality (msgDirection @d) (msgDirection @d') of
+  Just Refl -> Right x
+  Nothing -> Left "bad direction"
 
 msgDirectionInt :: MsgDirection -> Int
 msgDirectionInt = \case
@@ -469,26 +483,9 @@ msgDirToModeratedContent_ = \case
 ciModeratedText :: Text
 ciModeratedText = "moderated"
 
--- platform independent
-instance MsgDirectionI d => ToField (CIContent d) where
-  toField = toField . encodeJSON . dbJsonCIContent
-
--- platform specific
-instance MsgDirectionI d => ToJSON (CIContent d) where
-  toJSON = J.toJSON . jsonCIContent
-  toEncoding = J.toEncoding . jsonCIContent
-
 data ACIContent = forall d. MsgDirectionI d => ACIContent (SMsgDirection d) (CIContent d)
 
 deriving instance Show ACIContent
-
--- platform independent
-dbParseACIContent :: Text -> Either String ACIContent
-dbParseACIContent = fmap aciContentDBJSON . J.eitherDecodeStrict' . encodeUtf8
-
--- platform specific
-instance FromJSON ACIContent where
-  parseJSON = fmap aciContentJSON . J.parseJSON
 
 -- platform specific
 data JSONCIContent
@@ -518,14 +515,6 @@ data JSONCIContent
   | JCISndModerated
   | JCIRcvModerated
   | JCIInvalidJSON {direction :: MsgDirection, json :: Text}
-  deriving (Generic)
-
-instance FromJSON JSONCIContent where
-  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "JCI"
-
-instance ToJSON JSONCIContent where
-  toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "JCI"
-  toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "JCI"
 
 jsonCIContent :: forall d. MsgDirectionI d => CIContent d -> JSONCIContent
 jsonCIContent = \case
@@ -614,14 +603,6 @@ data DBJSONCIContent
   | DBJCISndModerated
   | DBJCIRcvModerated
   | DBJCIInvalidJSON {direction :: MsgDirection, json :: Text}
-  deriving (Generic)
-
-instance FromJSON DBJSONCIContent where
-  parseJSON = J.genericParseJSON . singleFieldJSON $ dropPrefix "DBJCI"
-
-instance ToJSON DBJSONCIContent where
-  toJSON = J.genericToJSON . singleFieldJSON $ dropPrefix "DBJCI"
-  toEncoding = J.genericToEncoding . singleFieldJSON $ dropPrefix "DBJCI"
 
 dbJsonCIContent :: forall d. MsgDirectionI d => CIContent d -> DBJSONCIContent
 dbJsonCIContent = \case
@@ -691,14 +672,7 @@ data CICallStatus
   | CISCallProgress
   | CISCallEnded
   | CISCallError
-  deriving (Show, Generic)
-
-instance FromJSON CICallStatus where
-  parseJSON = J.genericParseJSON . enumJSON $ dropPrefix "CISCall"
-
-instance ToJSON CICallStatus where
-  toJSON = J.genericToJSON . enumJSON $ dropPrefix "CISCall"
-  toEncoding = J.genericToEncoding . enumJSON $ dropPrefix "CISCall"
+  deriving (Show)
 
 ciCallInfoText :: CICallStatus -> Int -> Text
 ciCallInfoText status duration = case status of
@@ -710,3 +684,31 @@ ciCallInfoText status duration = case status of
   CISCallProgress -> "in progress " <> durationText duration
   CISCallEnded -> "ended " <> durationText duration
   CISCallError -> "error"
+
+$(JQ.deriveJSON (enumJSON $ dropPrefix "CISCall") ''CICallStatus)
+
+-- platform specific
+$(JQ.deriveJSON (sumTypeJSON $ dropPrefix "JCI") ''JSONCIContent)
+
+-- platform independent
+$(JQ.deriveJSON (singleFieldJSON $ dropPrefix "DBJCI") ''DBJSONCIContent)
+
+-- platform independent
+instance MsgDirectionI d => ToField (CIContent d) where
+  toField = toField . encodeJSON . dbJsonCIContent
+
+-- platform specific
+instance MsgDirectionI d => ToJSON (CIContent d) where
+  toJSON = J.toJSON . jsonCIContent
+  toEncoding = J.toEncoding . jsonCIContent
+
+instance MsgDirectionI d => FromJSON (CIContent d) where
+  parseJSON v = (\(ACIContent _ c) -> checkDirection c) <$?> J.parseJSON v
+
+-- platform independent
+dbParseACIContent :: Text -> Either String ACIContent
+dbParseACIContent = fmap aciContentDBJSON . J.eitherDecodeStrict' . encodeUtf8
+
+-- platform specific
+instance FromJSON ACIContent where
+  parseJSON = fmap aciContentJSON . J.parseJSON
