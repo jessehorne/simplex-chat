@@ -2,7 +2,6 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -44,14 +43,13 @@ import Database.SQLite.Simple.FromField (returnError, FromField(..))
 import Database.SQLite.Simple.Internal (Field (..))
 import Database.SQLite.Simple.Ok
 import Database.SQLite.Simple.ToField (ToField (..))
-import GHC.Generics (Generic)
 import Simplex.Chat.Types.Preferences
 import Simplex.Chat.Types.Util
 import Simplex.FileTransfer.Description (FileDigest)
 import Simplex.Messaging.Agent.Protocol (ACommandTag (..), ACorrId, AParty (..), APartyCmdTag (..), ConnId, ConnectionMode (..), ConnectionRequestUri, InvitationId, SAEntity (..), UserId)
 import Simplex.Messaging.Crypto.File (CryptoFileArgs (..))
 import Simplex.Messaging.Encoding.String
-import Simplex.Messaging.Parsers (dropPrefix, fromTextField_, sumTypeJSON, taggedObjectJSON, enumJSON)
+import Simplex.Messaging.Parsers (defaultJSON, dropPrefix, fromTextField_, sumTypeJSON, taggedObjectJSON, enumJSON)
 import Simplex.Messaging.Protocol (ProtoServerWithAuth, ProtocolTypeI)
 import Simplex.Messaging.Util ((<$?>))
 import Simplex.Messaging.Version
@@ -263,9 +261,7 @@ data UserContact = UserContact
     connReqContact :: ConnReqContact,
     groupId :: Maybe GroupId
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON UserContact where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 userContactGroupId :: UserContact -> Maybe GroupId
 userContactGroupId UserContact {groupId} = groupId
@@ -283,10 +279,7 @@ data UserContactRequest = UserContactRequest
     updatedAt :: UTCTime,
     xContactId :: Maybe XContactId
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON UserContactRequest where
-  toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 newtype XContactId = XContactId ByteString
   deriving (Eq, Show)
@@ -340,9 +333,7 @@ optionalFullName displayName fullName
   | otherwise = " (" <> fullName <> ")"
 
 data Group = Group {groupInfo :: GroupInfo, members :: [GroupMember]}
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON Group where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 type GroupId = Int64
 
@@ -358,9 +349,7 @@ data GroupInfo = GroupInfo
     updatedAt :: UTCTime,
     chatTs :: Maybe UTCTime
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON GroupInfo where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 groupName' :: GroupInfo -> GroupName
 groupName' GroupInfo {localDisplayName = g} = g
@@ -368,9 +357,7 @@ groupName' GroupInfo {localDisplayName = g} = g
 data GroupSummary = GroupSummary
   { currentMembers :: Int
   }
-  deriving (Show, Generic, FromJSON)
-
-instance ToJSON GroupSummary where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Show)
 
 data ContactOrGroup = CGContact Contact | CGGroup Group
 
@@ -385,9 +372,7 @@ data ChatSettings = ChatSettings
     sendRcpts :: Maybe Bool,
     favorite :: Bool
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON ChatSettings where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 defaultChatSettings :: ChatSettings
 defaultChatSettings =
@@ -401,18 +386,7 @@ chatHasNtfs :: ChatSettings -> Bool
 chatHasNtfs ChatSettings {enableNtfs} = enableNtfs /= MFNone
 
 data MsgFilter = MFNone | MFAll | MFMentions
-  deriving (Eq, Show, Generic)
-
-instance FromJSON MsgFilter where
-  parseJSON = J.genericParseJSON . enumJSON $ dropPrefix "MF"
-
-instance ToJSON MsgFilter where
-  toEncoding = J.genericToEncoding . enumJSON $ dropPrefix "MF"
-  toJSON = J.genericToJSON . enumJSON $ dropPrefix "MF"
-
-instance FromField MsgFilter where fromField = fromIntField_ msgFilterIntP
-
-instance ToField MsgFilter where toField = toField . msgFilterInt
+  deriving (Eq, Show)
 
 msgFilterInt :: MsgFilter -> Int
 msgFilterInt = \case
@@ -495,11 +469,7 @@ data Profile = Profile
     -- - incognito
     -- - local_alias
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON Profile where
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
+  deriving (Eq, Show)
 
 -- check if profiles match ignoring preferences
 profilesMatch :: LocalProfile -> LocalProfile -> Bool
@@ -521,11 +491,7 @@ data LocalProfile = LocalProfile
     preferences :: Maybe Preferences,
     localAlias :: LocalAlias
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON LocalProfile where
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
+  deriving (Eq, Show)
 
 localProfileId :: LocalProfile -> ProfileId
 localProfileId = profileId
@@ -545,11 +511,7 @@ data GroupProfile = GroupProfile
     image :: Maybe ImageData,
     groupPreferences :: Maybe GroupPreferences
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON GroupProfile where
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
+  deriving (Eq, Show)
 
 newtype ImageData = ImageData Text
   deriving (Eq, Show)
@@ -566,14 +528,6 @@ instance ToField ImageData where toField (ImageData t) = toField t
 instance FromField ImageData where fromField = fmap ImageData . fromField
 
 data CReqClientData = CRDataGroup {groupLinkId :: GroupLinkId}
-  deriving (Generic)
-
-instance ToJSON CReqClientData where
-  toJSON = J.genericToJSON . taggedObjectJSON $ dropPrefix "CRData"
-  toEncoding = J.genericToEncoding . taggedObjectJSON $ dropPrefix "CRData"
-
-instance FromJSON CReqClientData where
-  parseJSON = J.genericParseJSON . taggedObjectJSON $ dropPrefix "CRData"
 
 newtype GroupLinkId = GroupLinkId {unGroupLinkId :: ByteString} -- used to identify invitation via group link
   deriving (Eq, Show)
@@ -601,29 +555,19 @@ data GroupInvitation = GroupInvitation
     groupProfile :: GroupProfile,
     groupLinkId :: Maybe GroupLinkId
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON GroupInvitation where
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
+  deriving (Eq, Show)
 
 data MemberIdRole = MemberIdRole
   { memberId :: MemberId,
     memberRole :: GroupMemberRole
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON MemberIdRole where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 data IntroInvitation = IntroInvitation
   { groupConnReq :: ConnReqInvitation,
     directConnReq :: Maybe ConnReqInvitation
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON IntroInvitation where
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
+  deriving (Eq, Show)
 
 data MemberInfo = MemberInfo
   { memberId :: MemberId,
@@ -631,11 +575,7 @@ data MemberInfo = MemberInfo
     v :: Maybe ChatVersionRange,
     profile :: Profile
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON MemberInfo where
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
+  deriving (Eq, Show)
 
 memberInfo :: GroupMember -> MemberInfo
 memberInfo GroupMember {memberId, memberRole, memberProfile, activeConn} =
@@ -674,16 +614,10 @@ data GroupMember = GroupMember
     memberContactProfileId :: ProfileId,
     activeConn :: Maybe Connection
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON GroupMember where
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
+  deriving (Eq, Show)
 
 data GroupMemberRef = GroupMemberRef {groupMemberId :: Int64, profile :: Profile}
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON GroupMemberRef where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 groupMemberRef :: GroupMember -> GroupMemberRef
 groupMemberRef GroupMember {groupMemberId, memberProfile = p} =
@@ -743,14 +677,7 @@ instance ToJSON MemberId where
   toEncoding = strToJEncoding
 
 data InvitedBy = IBContact {byContactId :: Int64} | IBUser | IBUnknown
-  deriving (Eq, Show, Generic)
-
-instance FromJSON InvitedBy where
-  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "IB"
-
-instance ToJSON InvitedBy where
-  toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "IB"
-  toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "IB"
+  deriving (Eq, Show)
 
 toInvitedBy :: Int64 -> Maybe Int64 -> InvitedBy
 toInvitedBy userCtId (Just ctId)
@@ -802,9 +729,7 @@ instance ToJSON GroupMemberRole where
 data GroupMemberSettings = GroupMemberSettings
   { showMessages :: Bool
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON GroupMemberSettings where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 defaultMemberSettings :: GroupMemberSettings
 defaultMemberSettings = GroupMemberSettings {showMessages = True}
@@ -985,9 +910,7 @@ data SndFileTransfer = SndFileTransfer
     fileDescrId :: Maybe Int64,
     fileInline :: Maybe InlineFileMode
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON SndFileTransfer where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 sndFileTransferConnId :: SndFileTransfer -> ConnId
 sndFileTransferConnId SndFileTransfer {agentConnId = AgentConnId acId} = acId
@@ -1002,24 +925,10 @@ data FileInvitation = FileInvitation
     fileInline :: Maybe InlineFileMode,
     fileDescr :: Maybe FileDescr
   }
-  deriving (Eq, Show, Generic)
-
-instance ToJSON FileInvitation where
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-
-instance FromJSON FileInvitation where
-  parseJSON = J.genericParseJSON J.defaultOptions {J.omitNothingFields = True}
+  deriving (Eq, Show)
 
 data FileDescr = FileDescr {fileDescrText :: Text, fileDescrPartNo :: Int, fileDescrComplete :: Bool}
-  deriving (Eq, Show, Generic)
-
-instance ToJSON FileDescr where
-  toEncoding = J.genericToEncoding J.defaultOptions
-  toJSON = J.genericToJSON J.defaultOptions
-
-instance FromJSON FileDescr where
-  parseJSON = J.genericParseJSON J.defaultOptions
+  deriving (Eq, Show)
 
 xftpFileInvitation :: FilePath -> Integer -> FileDescr -> FileInvitation
 xftpFileInvitation fileName fileSize fileDescr =
@@ -1035,7 +944,7 @@ xftpFileInvitation fileName fileSize fileDescr =
 data InlineFileMode
   = IFMOffer -- file will be sent inline once accepted
   | IFMSent -- file is sent inline without acceptance
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Show)
 
 instance TextEncoding InlineFileMode where
   textEncode = \case
@@ -1071,18 +980,14 @@ data RcvFileTransfer = RcvFileTransfer
     -- SMP files are encrypted after all chunks are received
     cryptoArgs :: Maybe CryptoFileArgs
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON RcvFileTransfer where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 data XFTPRcvFile = XFTPRcvFile
   { rcvFileDescription :: RcvFileDescr,
     agentRcvFileId :: Maybe AgentRcvFileId,
     agentRcvFileDeleted :: Bool
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON XFTPRcvFile where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 data RcvFileDescr = RcvFileDescr
   { fileDescrId :: Int64,
@@ -1090,9 +995,7 @@ data RcvFileDescr = RcvFileDescr
     fileDescrPartNo :: Int,
     fileDescrComplete :: Bool
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON RcvFileDescr where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 data RcvFileStatus
   = RFSNew
@@ -1100,14 +1003,7 @@ data RcvFileStatus
   | RFSConnected RcvFileInfo
   | RFSComplete RcvFileInfo
   | RFSCancelled (Maybe RcvFileInfo)
-  deriving (Eq, Show, Generic)
-
-instance FromJSON RcvFileStatus where
-  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "RFS"
-
-instance ToJSON RcvFileStatus where
-  toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "RFS"
-  toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "RFS"
+  deriving (Eq, Show)
 
 rcvFileComplete :: RcvFileStatus -> Bool
 rcvFileComplete = \case
@@ -1122,9 +1018,7 @@ data RcvFileInfo = RcvFileInfo
     connId :: Maybe Int64,
     agentConnId :: Maybe AgentConnId
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON RcvFileInfo where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 liveRcvFileTransferInfo :: RcvFileTransfer -> Maybe RcvFileInfo
 liveRcvFileTransferInfo RcvFileTransfer {fileStatus} = case fileStatus of
@@ -1225,14 +1119,7 @@ data FileTransfer
         sndFileTransfers :: [SndFileTransfer]
       }
   | FTRcv {rcvFileTransfer :: RcvFileTransfer}
-  deriving (Show, Generic)
-
-instance FromJSON FileTransfer where
-  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "FT"
-
-instance ToJSON FileTransfer where
-  toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "FT"
-  toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "FT"
+  deriving (Show)
 
 data FileTransferMeta = FileTransferMeta
   { fileId :: FileTransferId,
@@ -1244,9 +1131,7 @@ data FileTransferMeta = FileTransferMeta
     chunkSize :: Integer,
     cancelled :: Bool
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON FileTransferMeta where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 data XFTPSndFile = XFTPSndFile
   { agentSndFileId :: AgentSndFileId,
@@ -1254,9 +1139,7 @@ data XFTPSndFile = XFTPSndFile
     agentSndFileDeleted :: Bool,
     cryptoArgs :: Maybe CryptoFileArgs
   }
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON XFTPSndFile where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 fileTransferCancelled :: FileTransfer -> Bool
 fileTransferCancelled (FTSnd FileTransferMeta {cancelled} _) = cancelled
@@ -1317,7 +1200,7 @@ data Connection = Connection
     authErrCounter :: Int,
     createdAt :: UTCTime
   }
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Show)
 
 connReady :: Connection -> Bool
 connReady Connection {connStatus} = connStatus == ConnReady || connStatus == ConnSndReady
@@ -1329,9 +1212,7 @@ connDisabled :: Connection -> Bool
 connDisabled Connection {authErrCounter} = authErrCounter >= authErrDisableCount
 
 data SecurityCode = SecurityCode {securityCode :: Text, verifiedAt :: UTCTime}
-  deriving (Eq, Show, Generic, FromJSON)
-
-instance ToJSON SecurityCode where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Eq, Show)
 
 verificationCode :: ByteString -> Text
 verificationCode = T.pack . unwords . chunks 5 . show . os2ip
@@ -1350,13 +1231,6 @@ aConnId Connection {agentConnId = AgentConnId cId} = cId
 connIncognito :: Connection -> Bool
 connIncognito Connection {customUserProfileId} = isJust customUserProfileId
 
-instance FromJSON Connection where
-  parseJSON = J.genericParseJSON J.defaultOptions {J.omitNothingFields = True}
-
-instance ToJSON Connection where
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
-
 data PendingContactConnection = PendingContactConnection
   { pccConnId :: Int64,
     pccAgentConnId :: AgentConnId,
@@ -1370,12 +1244,10 @@ data PendingContactConnection = PendingContactConnection
     createdAt :: UTCTime,
     updatedAt :: UTCTime
   }
-  deriving (Eq, Show, Generic, FromJSON)
+  deriving (Eq, Show)
 
 aConnId' :: PendingContactConnection -> ConnId
 aConnId' PendingContactConnection {pccAgentConnId = AgentConnId cId} = cId
-
-instance ToJSON PendingContactConnection where toEncoding = J.genericToEncoding J.defaultOptions
 
 data ConnStatus
   = -- | connection is created by initiating party with agent NEW command (createConnection)
@@ -1511,7 +1383,7 @@ data NetworkStatus
   | NSConnected
   | NSDisconnected
   | NSError {connectionError :: String}
-  deriving (Eq, Ord, Show, Generic)
+  deriving (Eq, Ord, Show)
 
 netStatusStr :: NetworkStatus -> String
 netStatusStr = \case
@@ -1520,20 +1392,11 @@ netStatusStr = \case
   NSDisconnected -> "disconnected"
   NSError e -> "error: " <> e
 
-instance FromJSON NetworkStatus where
-  parseJSON = J.genericParseJSON . sumTypeJSON $ dropPrefix "NS"
-
-instance ToJSON NetworkStatus where
-  toJSON = J.genericToJSON . sumTypeJSON $ dropPrefix "NS"
-  toEncoding = J.genericToEncoding . sumTypeJSON $ dropPrefix "NS"
-
 data ConnNetworkStatus = ConnNetworkStatus
   { agentConnId :: AgentConnId,
     networkStatus :: NetworkStatus
   }
-  deriving (Show, Generic, FromJSON)
-
-instance ToJSON ConnNetworkStatus where toEncoding = J.genericToEncoding J.defaultOptions
+  deriving (Show)
 
 type CommandId = Int64
 
@@ -1547,7 +1410,7 @@ data CommandStatus
   = CSCreated
   | CSCompleted -- unused - was replaced with deleteCommand
   | CSError -- internal command error, e.g. not matching connection id or unexpected response, not related to agent message ERR
-  deriving (Show, Generic)
+  deriving (Show)
 
 instance FromField CommandStatus where fromField = fromTextField_ textDecode
 
@@ -1574,7 +1437,7 @@ data CommandFunction
   | CFAcceptContact
   | CFAckMessage
   | CFDeleteConn -- not used
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Show)
 
 instance FromField CommandFunction where fromField = fromTextField_ textDecode
 
@@ -1640,14 +1503,7 @@ data ServerCfg p = ServerCfg
     tested :: Maybe Bool,
     enabled :: Bool
   }
-  deriving (Show, Generic)
-
-instance ProtocolTypeI p => ToJSON (ServerCfg p) where
-  toEncoding = J.genericToEncoding J.defaultOptions {J.omitNothingFields = True}
-  toJSON = J.genericToJSON J.defaultOptions {J.omitNothingFields = True}
-
-instance ProtocolTypeI p => FromJSON (ServerCfg p) where
-  parseJSON = J.genericParseJSON J.defaultOptions {J.omitNothingFields = True}
+  deriving (Show)
 
 newtype ChatVersionRange = ChatVersionRange {fromChatVRange :: VersionRange} deriving (Eq, Show)
 
@@ -1673,14 +1529,95 @@ instance ToJSON JVersionRange where
   toJSON (JVersionRange (VersionRange minV maxV)) = J.object ["minVersion" .= minV, "maxVersion" .= maxV]
   toEncoding (JVersionRange (VersionRange minV maxV)) = J.pairs $ "minVersion" .= minV <> "maxVersion" .= maxV
 
-$(JQ.deriveJSON defOpts ''UserPwdHash)
+$(JQ.deriveJSON defaultJSON ''UserContact)
 
-$(JQ.deriveJSON defOpts ''User)
+$(JQ.deriveJSON defaultJSON ''Profile)
 
-$(JQ.deriveJSON defOpts ''NewUser)
+$(JQ.deriveJSON defaultJSON ''LocalProfile)
 
-$(JQ.deriveJSON defOpts ''UserInfo)
+$(JQ.deriveJSON defaultJSON ''UserContactRequest)
 
-$(JQ.deriveJSON defOpts ''Contact)
+$(JQ.deriveJSON defaultJSON ''GroupProfile)
 
-$(JQ.deriveJSON defOpts ''ContactRef)
+$(JQ.deriveJSON (sumTypeJSON $ dropPrefix "IB") ''InvitedBy)
+
+$(JQ.deriveJSON defaultJSON ''GroupMemberSettings)
+
+$(JQ.deriveJSON defaultJSON ''SecurityCode)
+
+$(JQ.deriveJSON (sumTypeJSON $ dropPrefix "NS") ''NetworkStatus)
+
+$(JQ.deriveJSON defaultJSON ''ConnNetworkStatus)
+
+$(JQ.deriveJSON defaultJSON ''Connection)
+
+$(JQ.deriveJSON defaultJSON ''PendingContactConnection)
+
+$(JQ.deriveJSON defaultJSON ''GroupMember)
+
+$(JQ.deriveJSON (enumJSON $ dropPrefix "MF") ''MsgFilter)
+
+$(JQ.deriveJSON defaultJSON ''ChatSettings)
+
+$(JQ.deriveJSON defaultJSON ''GroupInfo)
+
+$(JQ.deriveJSON defaultJSON ''Group)
+
+$(JQ.deriveJSON defaultJSON ''GroupSummary)
+
+instance FromField MsgFilter where fromField = fromIntField_ msgFilterIntP
+
+instance ToField MsgFilter where toField = toField . msgFilterInt
+
+$(JQ.deriveJSON (taggedObjectJSON $ dropPrefix "CRData") ''CReqClientData)
+
+$(JQ.deriveJSON defaultJSON ''MemberIdRole)
+
+$(JQ.deriveJSON defaultJSON ''GroupInvitation)
+
+$(JQ.deriveJSON defaultJSON ''IntroInvitation)
+
+$(JQ.deriveJSON defaultJSON ''MemberInfo)
+
+$(JQ.deriveJSON defaultJSON ''GroupMemberRef)
+
+$(JQ.deriveJSON defaultJSON ''FileDescr)
+
+$(JQ.deriveJSON defaultJSON ''FileInvitation)
+
+$(JQ.deriveJSON defaultJSON ''SndFileTransfer)
+
+$(JQ.deriveJSON defaultJSON ''RcvFileDescr)
+
+$(JQ.deriveJSON defaultJSON ''XFTPRcvFile)
+
+$(JQ.deriveJSON defaultJSON ''RcvFileInfo)
+
+$(JQ.deriveJSON (sumTypeJSON $ dropPrefix "RFS") ''RcvFileStatus)
+
+$(JQ.deriveJSON defaultJSON ''RcvFileTransfer)
+
+$(JQ.deriveJSON defaultJSON ''XFTPSndFile)
+
+$(JQ.deriveJSON defaultJSON ''FileTransferMeta)
+
+$(JQ.deriveJSON (sumTypeJSON $ dropPrefix "FT") ''FileTransfer)
+
+$(JQ.deriveJSON defaultJSON ''UserPwdHash)
+
+$(JQ.deriveJSON defaultJSON ''User)
+
+$(JQ.deriveJSON defaultJSON ''NewUser)
+
+$(JQ.deriveJSON defaultJSON ''UserInfo)
+
+$(JQ.deriveJSON defaultJSON ''Contact)
+
+$(JQ.deriveJSON defaultJSON ''ContactRef)
+
+instance ProtocolTypeI p => ToJSON (ServerCfg p) where
+  toEncoding = $(JQ.mkToEncoding defaultJSON ''ServerCfg)
+  toJSON = $(JQ.mkToJSON defaultJSON ''ServerCfg)
+
+instance ProtocolTypeI p => FromJSON (ServerCfg p) where
+  parseJSON = $(JQ.mkParseJSON defaultJSON ''ServerCfg)
