@@ -56,11 +56,11 @@ remoteHandshakeTest viaDesktop = testChat2 aliceProfile aliceDesktopProfile $ \m
 
   desktop ##> "/list remote hosts"
   desktop <## "Remote hosts:"
-  desktop <## "1. Mobile (active)"
+  desktop <## "1. Mobile (connected)"
 
   mobile ##> "/list remote ctrls"
   mobile <## "Remote controllers:"
-  mobile <## "1. My desktop (active)"
+  mobile <## "1. My desktop (connected)"
 
   if viaDesktop then stopDesktop mobile desktop else stopMobile mobile desktop
 
@@ -396,6 +396,7 @@ startRemote mobile desktop = do
   mobile <## ("/verify remote ctrl " <> sessId)
   mobile ##> ("/verify remote ctrl " <> sessId)
   mobile <## "remote controller 1 session started with My desktop"
+  desktop <## "new remote host 1 added: Mobile"
   desktop <## "remote host 1 connected"
 
 startRemoteStored :: TestCC -> TestCC -> IO ()

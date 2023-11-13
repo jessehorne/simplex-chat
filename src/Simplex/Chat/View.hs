@@ -277,7 +277,6 @@ responseToView hu@(currentRH, user_) ChatConfig {logLevel, showReactions, showRe
   CRNtfTokenStatus status -> ["device token status: " <> plain (smpEncode status)]
   CRNtfToken _ status mode -> ["device token status: " <> plain (smpEncode status) <> ", notifications mode: " <> plain (strEncode mode)]
   CRNtfMessages {} -> []
-  CRRemoteHostCreated RemoteHostInfo {remoteHostId} -> ["remote host " <> sShow remoteHostId <> " created"]
   CRCurrentRemoteHost rhi_ ->
     [ maybe
         "Using local profile"
@@ -295,6 +294,7 @@ responseToView hu@(currentRH, user_) ChatConfig {logLevel, showReactions, showRe
       "Compare session code with host:",
       plain sessionCode
     ]
+  CRNewRemoteHost RemoteHostInfo {remoteHostId = rhId, hostDeviceName} -> ["new remote host " <> sShow rhId <> " added: " <> plain hostDeviceName]
   CRRemoteHostConnected RemoteHostInfo {remoteHostId = rhId} -> ["remote host " <> sShow rhId <> " connected"]
   CRRemoteHostStopped rhId -> ["remote host " <> sShow rhId <> " stopped"]
   CRRemoteFileStored rhId (CryptoFile filePath cfArgs_) ->
@@ -1700,8 +1700,14 @@ viewRemoteHosts = \case
   [] -> ["No remote hosts"]
   hs -> "Remote hosts: " : map viewRemoteHostInfo hs
   where
-    viewRemoteHostInfo RemoteHostInfo {remoteHostId, hostDeviceName, sessionActive} =
-      plain $ tshow remoteHostId <> ". " <> hostDeviceName <> if sessionActive then " (active)" else ""
+    viewRemoteHostInfo RemoteHostInfo {remoteHostId, hostDeviceName, sessionState} =
+      plain $ tshow remoteHostId <> ". " <> hostDeviceName <> maybe "" viewSessionState sessionState
+    viewSessionState = \case
+      RHSStarting -> " (starting)"
+      RHSConnecting _ -> " (connecting)"
+      RHSPendingConfirmation {sessionCode} -> " (pending confirmation, code: " <> sessionCode <> ")"
+      RHSConfirmed -> " (confirmed)"
+      RHSConnected -> " (connected)"
 
 viewRemoteCtrls :: [RemoteCtrlInfo] -> [StyledString]
 viewRemoteCtrls = \case
@@ -1709,7 +1715,7 @@ viewRemoteCtrls = \case
   hs -> "Remote controllers: " : map viewRemoteCtrlInfo hs
   where
     viewRemoteCtrlInfo RemoteCtrlInfo {remoteCtrlId, ctrlDeviceName, sessionActive} =
-      plain $ tshow remoteCtrlId <> ". " <> ctrlDeviceName <> if sessionActive then " (active)" else ""
+      plain $ tshow remoteCtrlId <> ". " <> ctrlDeviceName <> if sessionActive then " (connected)" else ""
 
 -- TODO fingerprint, accepted?
 viewRemoteCtrl :: RemoteCtrlInfo -> StyledString
